@@ -1,132 +1,123 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"github.com/bmaupin/go-epub"
-	"html"
+	"golang.org/x/net/html"
 	"io"
+	"log"
 	"net/http"
-	"regexp"
 	"strings"
-	"time"
+
+	"github.com/antchfx/htmlquery"
+	"github.com/bmaupin/go-epub"
 )
 
-type ChapterResponse struct {
-	Data struct {
-		Content string `json:"content"`
-		Name    string `json:"name"`
-	} `json:"data"`
-}
-
-func main() {
-	book := epub.NewEpub("Повелитель Тайн — Том 2")
-
-	for i := 214; i <= 482; i++ {
-		url := fmt.Sprintf("https://api.cdnlibs.org/api/manga/20818--lord-of-the-mysteries/chapter?branch_id=18695&number=%d&volume=2", i)
-		var ch ChapterResponse
-		var success bool
-
-		for attempt := 1; attempt <= 3; attempt++ {
-			err := fetchChapter(url, &ch)
-			if err != nil {
-				fmt.Printf("Ошибка при получении главы %d (попытка %d): %v\n", i, attempt, err)
-				time.Sleep(30 * time.Second)
-				continue
-			}
-			success = true
-			break
-		}
-
-		if !success {
-			fmt.Printf("⛔ Пропуск главы %d после 3 неудачных попыток\n", i)
-			continue
-		}
-
-		// Очистка и преобразование текста
-		htmlContent := ch.Data.Content
-		htmlContent = strings.ReplaceAll(htmlContent, "<br>", "\n")
-		htmlContent = strings.ReplaceAll(htmlContent, "</p>", "\n\n")
-		decoded := html.UnescapeString(htmlContent)
-
-		tagRe := regexp.MustCompile(`<[^>]*>`)
-		plain := tagRe.ReplaceAllString(decoded, "")
-
-		lines := strings.Split(plain, "\n")
-		for i := range lines {
-			lines[i] = strings.TrimSpace(lines[i])
-		}
-
-		var result []string
-		for i := 0; i < len(lines); i++ {
-			if lines[i] == "" {
-				result = append(result, "")
-				continue
-			}
-			j := i + 1
-			for j < len(lines) && lines[j] != "" {
-				lines[i] += " " + lines[j]
-				j++
-			}
-			result = append(result, lines[i])
-			i = j - 1
-		}
-
-		clean := strings.Join(result, "\n")
-
-		// Формируем HTML главы
-		chapterTitle := fmt.Sprintf("Глава %d — %s", i, ch.Data.Name)
-		html := "<h1>" + chapterTitle + "</h1>\n"
-		for _, p := range strings.Split(clean, "\n\n") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				html += "<p>" + p + "</p>\n"
-			}
-		}
-
-		_, err := book.AddSection(html, chapterTitle, "", "")
-		if err != nil {
-			fmt.Println("AddSection error:", err)
-		} else {
-			fmt.Println("✅ Добавлена", chapterTitle)
-		}
+func fetchPage(url string) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; RanobeFetcher/1.0)")
 
-	if err := book.Write("Повелитель Тайн Том 2.epub"); err != nil {
-		fmt.Println("Ошибка записи EPUB:", err)
-	} else {
-		fmt.Println("📘 Готово: LordOfTheMysteries_Vol2.epub")
-	}
-}
-
-// fetchChapter делает HTTP-запрос и парсит JSON
-func fetchChapter(url string, ch *ChapterResponse) error {
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Cookie", "__ddg8=fglm9zuCRxl38bMF; __ddg10=176289442; __ddg9=185.26.31.40; __ddg1=QOvJMhHSuOM3xsEM8Enh")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://ranobelib.me/")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8")
-
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("HTTP error: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("Read error: %w", err)
+		return "", err
+	}
+	return string(bodyBytes), nil
+}
+
+func parseTitle(doc *html.Node) string {
+	titleNode := htmlquery.FindOne(doc, "/html/body/div[2]/div[5]/div[1]/div[3]/h1")
+	if titleNode == nil {
+		return ""
+	}
+	return strings.TrimSpace(htmlquery.InnerText(titleNode))
+}
+
+func parseContent(doc *html.Node) (string, error) {
+	divNode := htmlquery.FindOne(doc, "/html/body/div[2]/div[5]/div[1]")
+	if divNode == nil {
+		return "", fmt.Errorf("div not found")
 	}
 
-	if err := json.Unmarshal(body, ch); err != nil {
-		return fmt.Errorf("JSON error: %w", err)
+	pNodes := htmlquery.Find(divNode, ".//p")
+	if len(pNodes) == 0 {
+		return "", nil
 	}
 
-	if ch.Data.Content == "" {
-		return fmt.Errorf("пустое содержимое главы")
+	var parts []string
+	for _, p := range pNodes {
+		htmlP := htmlquery.OutputHTML(p, true)
+		trimmed := strings.TrimSpace(htmlP)
+		if trimmed == "" || trimmed == "<p></p>" {
+			continue
+		}
+		parts = append(parts, htmlP)
 	}
 
-	return nil
+	return strings.Join(parts, "\n"), nil
+}
+
+func main() {
+	e := epub.NewEpub("Моя ранобэ книга")
+	e.SetAuthor("Автор")
+
+	for i := 215; i < 483; i++ {
+		url := fmt.Sprintf("https://ranobehub.org/ranobe/510/2/%d", i)
+
+		log.Printf("Fetching %s\n", url)
+
+		htmlStr, err := fetchPage(url)
+		if err != nil {
+			log.Printf("Error fetching %s: %v\n", url, err)
+			continue
+		}
+
+		doc, err := htmlquery.Parse(strings.NewReader(htmlStr))
+		if err != nil {
+			log.Printf("Parse error on %s: %v\n", url, err)
+			continue
+		}
+
+		title := parseTitle(doc)
+		if title == "" {
+			title = fmt.Sprintf("Глава %d", i+1)
+		}
+
+		contentHTML, err := parseContent(doc)
+		if err != nil {
+			log.Printf("Parse content error on %s: %v\n", url, err)
+			continue
+		}
+		if strings.TrimSpace(contentHTML) == "" {
+			log.Printf("No content found on %s — пропускаю\n", url)
+			continue
+		}
+
+		fullHTML := fmt.Sprintf("<h1>%s</h1>\n%s", html.EscapeString(title), contentHTML)
+
+		_, err = e.AddSection(fullHTML, title, "", "")
+		if err != nil {
+			log.Printf("Error adding section for %s: %v\n", url, err)
+			continue
+		}
+	}
+
+	outFile := "Повелитель тайн Том 2.epub"
+	if err := e.Write(outFile); err != nil {
+		log.Fatalf("Error writing epub: %v\n", err)
+	}
+
+	log.Printf("EPUB saved to %s\n", outFile)
 }
